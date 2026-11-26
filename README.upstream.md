@@ -1,0 +1,72 @@
+> 以下为上游 Shizzi 原始说明，不表示本衍生项目已完成对应功能的实机验收。
+
+<p align="center">
+  <img src="docs/assets/icon.png" width="96" alt="">
+</p>
+
+<h1 align="center">Shizzi</h1>
+
+<p align="center">
+  Wi-Fi, USB, and Ethernet tethering over a Shizuku-privileged test network.
+</p>
+
+Creates a test TUN interface, sets it as the preferred tethering upstream, and
+forwards hotspot traffic through a Go datapath. Supports IPv4 and IPv6.
+
+## Requirements
+
+- Android 11 (API 30+), 64-bit or 32-bit ARM (arm64-v8a or armeabi-v7a)
+- [Shizuku](https://shizuku.rikka.app/) 13.6.0+
+
+Android 13 and up work outright. On Android 11 and 12 it depends on the device's
+tethering module; the app checks on first launch and offers to install the
+module it needs. That module is 64-bit only, so a 32-bit device needs Android
+13. See [compatibility](docs/android-compatibility.md).
+
+## Install
+
+Download the APK from the
+[latest release](https://github.com/carlelieser/shizzi/releases/latest).
+
+## Features
+
+- 🚀 **Unlimited hotspot.** Sharing draws on your regular data instead of your
+  hotspot allowance.
+- 🛡️ **VPN compatible.** Stay private on every connected device.
+- ⚙️ **Uses your existing hotspot.** No extra configuration required.
+- 🔌 **Wired tethering.** Share over a USB cable to a computer, or over a USB-C
+  Ethernet adapter, alongside or instead of the hotspot. Pick it under
+  Settings → Tethering → Wired tethering; turn off Wi-Fi hotspot there to share
+  over the cable only. See [Ethernet tethering](docs/android-compatibility.md#ethernet-tethering)
+  for what an adapter needs.
+- 🙌 **No root.** Shizuku is all it needs.
+- 🎛️ **One tap away.** A quick settings tile starts and stops sharing from the
+  notification shade.
+- 🤖 **Automatable.** Start and stop from Tasker or MacroDroid. See
+  [automation](docs/automation.md).
+
+## Troubleshooting
+
+**Shizuku stops when the hotspot or wired tethering turns on.** If you start
+Shizuku with Wireless Debugging, a network change can turn Wireless Debugging
+off and take Shizuku with it. Sharing resumes once Shizuku is started again.
+Starting Shizuku with root, or over adb in TCP mode, avoids the problem.
+
+**Connected devices bypass the VPN, or sharing won't start with VPN set to
+Always.**
+Shizzi only sees a VPN that covers every app. If your VPN app has per-app proxy
+or split tunneling turned on (v2rayNG and AmneziaVPN, for example), Shizzi
+cannot detect the VPN. Turn that setting off in the VPN app.
+
+## Build
+
+Needs the Android SDK with NDK, Go, and gomobile:
+
+```
+go install golang.org/x/mobile/cmd/gomobile@latest && gomobile init
+./gradlew assembleDebug
+```
+
+## License
+
+[MIT](LICENSE)

@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Wi-Fi 警告</title>
+<style>body{background:#171510;color:#fff3df;font:18px system-ui;margin:0;min-height:100vh;display:grid;place-items:center}main{width:min(86vw,560px);padding:32px 0}small{color:#ffc36a;letter-spacing:.16em}h1{font-size:42px;line-height:1.15}p{line-height:1.7;white-space:pre-wrap}button{display:block;width:100%;padding:20px;border:0;border-radius:14px;background:#ffc36a;color:#241a0b;font:bold 20px system-ui}audio{width:100%;margin-top:24px}img{max-width:100%;border-radius:14px}#status{font-size:15px;color:#d8c8ad}</style>
+<main><small>PERSONAL HOTSPOT</small><h1 id="title">谢尔顿的 Wi-Fi 警告</h1><p id="message">你已连接我的个人热点。请先听这段警告录音。</p><img id="image" hidden alt="警告图片"><button id="play">▶ 播放警告录音</button><audio id="audio" src="warning.m4a" controls preload="metadata"></audio><p id="status" role="status">点击按钮播放；请确认设备音量已打开。</p></main>
+<script>
+const audio=document.querySelector('#audio'),status=document.querySelector('#status');
+document.querySelector('#play').onclick=()=>audio.play().catch(()=>status.textContent='无法播放，请使用下方音频控件重试。');
+audio.onplaying=()=>status.textContent='正在播放警告录音…';audio.onended=()=>status.textContent='播放结束，可以关闭本页。';
+fetch('config.json',{cache:'no-store'}).then(r=>r.json()).then(c=>{document.title=c.title;document.querySelector('#title').textContent=c.title;document.querySelector('#message').textContent=c.message;if(c.audio)audio.src=c.audio;if(c.image){const i=document.querySelector('#image');i.src=c.image;i.hidden=false;}}).catch(()=>{});
+</script></html>

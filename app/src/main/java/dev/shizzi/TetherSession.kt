@@ -1,0 +1,300 @@
+package dev.shizzi
+
+import android.content.Context
+import android.os.Build
+import android.util.Log
+import java.net.Inet6Address
+import java.net.InetAddress
+import org.json.JSONArray
+import org.json.JSONObject
+
+enum class SessionState { IDLE, STARTING, ACTIVE, ERROR }
+
+class TetherSession(private val context: Context) {
+
+    private val testNetworkApi = TestNetworkApi(context)
+    private val inspector = UpstreamInspector()
+
+    private var resources: SessionResources? = null
+    private var state = SessionState.IDLE
+    private var detail = "not started"
+    private var interfaceName: String? = null
+
+    private var activeSince: Long = 0
+    private var vpnMode = VpnMode.AUTO
+    private var customDns = emptyList<InetAddress>()
+
+    @Volatile
+    private var setup = SharingSetup(WiredTethering.OFF, isWifiHotspotChosen = true)
+
+    private var watchdog: SessionWatchdog? = null
+    private var events: TetheringEvents? = null
+    private var warningConnections: WarningConnections? = null
+    private var warningEnabled = true
+    fun setWarningEnabled(enabled: Boolean) { warningEnabled = enabled; resources?.setWarningEnabled(enabled) }
+    fun rearmWarning() { resources?.rearmWarning() }
+    fun warningStatus(): String = resources?.warningStatus()
+        ?: JSONObject().put("enabled", warningEnabled).put("pending", false).put("mode", "shared").toString()
+    private val teardown = SessionTeardown(context)
+    private val downstream = DownstreamInspector()
+    private val started = StartedDownstreams()
+    private val starter = DownstreamStarter(context, started)
+    private val links = listOf(AndroidUsbLink(context, started), AndroidEthernetLink(context, started))
+
+    @Volatile
+    private var wired = WiredDownstream(setup, links)
+
+    private val vpn = VpnUpstream(context) { problem -> tearDownAfter(problem) }
+
+    val isActive: Boolean get() = state == SessionState.ACTIVE
+
+    fun start(mode: VpnMode, sharing: SharingSetup, dnsServers: List<InetAddress>): String {
+        if (isActive) return status()
+
+        vpnMode = mode
+        customDns = dnsServers
+        setup = sharing
+        wired = WiredDownstream(sharing, links, SessionLog::info)
+        state = SessionState.STARTING
+        SessionLog.info(
+            "session start requested (vpn mode ${mode.name.lowercase()}, " +
+                "wired tethering ${sharing.wired.name.lowercase()}, " +
+                "wifi hotspot ${if (sharing.isWifiHotspotOn) "on" else "off"})",
+        )
+
+        SessionLog.info(
+            "device: ${Build.MANUFACTURER} ${Build.MODEL}, " +
+                "android ${Build.VERSION.RELEASE} (sdk ${Build.VERSION.SDK_INT}), " +
+                "contract ${TetherService.CONTRACT_VERSION}",
+        )
+
+        val startProblem = wired.startProblem()
+        if (startProblem != null) {
+            SessionLog.warn("start refused: $startProblem")
+            state = SessionState.ERROR
+            detail = startProblem
+            return status()
+        }
+
+        return runCatching { bringUp() }
+            .getOrElse { failure ->
+                Log.e(TAG, "start failed", failure)
+                SessionLog.error(
+                    "start failed: ${failure.javaClass.simpleName}: ${failure.message}",
+                )
+                stop()
+                state = SessionState.ERROR
+                detail = "${failure.javaClass.simpleName}: ${failure.message}"
+                status()
+            }
+    }
+
+    private fun bringUp(): String {
+        val group = SessionResources(testNetworkApi, context.connectivityManager())
+        resources = group
+
+        val name = group.acquire(tunAddresses(), sessionDns().servers, AVAILABILITY_TIMEOUT_MS)
+        interfaceName = name
+        SessionLog.info("tun up: $name (mtu $TUN_MTU, $TUN_ADDRESS, $TUN_ADDRESS_V6)")
+
+        group.startDatapath(TUN_MTU)
+        group.setWarningEnabled(warningEnabled)
+        SessionLog.info("datapath attached to $name")
+        followVpn(group)
+
+        preferTestNetworks()
+        val isTethered = starter.start(wired.typesToStart())
+
+        if (isTethered || !wired.canStartUntethered) {
+            verifyUpstream(name)
+            SessionLog.info("upstream verified: $name is sole upstream")
+        }
+
+        state = SessionState.ACTIVE
+        activeSince = System.currentTimeMillis()
+        detail = "tethered clients routing through $name"
+
+        teardown.installShutdownHook(started)
+        warningConnections = WarningConnections(context) { resources?.rearmWarning() }.also { it.start() }
+        startWatchdog(name)
+        return status()
+    }
+
+    private fun sessionDns(): SessionDns {
+        val vpnDns = when (vpnMode) {
+            VpnMode.NEVER -> emptyList()
+            else -> vpn.dnsServers().getOrElse { failure ->
+                SessionLog.warn("could not read the vpn's dns servers: ${failure.message}")
+                emptyList()
+            }
+        }
+        val upstreamDns = if (customDns.isEmpty() && vpnDns.isEmpty()) runCatching {
+            val cm = context.connectivityManager()
+            cm.getLinkProperties(cm.activeNetwork)?.dnsServers.orEmpty()
+        }.getOrDefault(emptyList()) else emptyList()
+        val dns = if (upstreamDns.isNotEmpty()) SessionDns(upstreamDns, DnsSource.DEFAULT)
+            else chooseDns(customDns, vpnDns)
+        SessionLog.info(
+            "dns: ${dns.source.name.lowercase()} " +
+                dns.servers.joinToString(prefix = "[", postfix = "]") { it.hostAddress.orEmpty() },
+        )
+        if (dns.servers.none { it is Inet6Address }) {
+            SessionLog.warn("dns: no ipv6 server, so tethering provisions ipv4 only")
+        }
+        return dns
+    }
+
+    private fun followVpn(group: SessionResources) {
+        if (vpnMode == VpnMode.NEVER) {
+            SessionLog.info("vpn mode never: datapath left unbound")
+            return
+        }
+
+        check(vpnMode != VpnMode.ALWAYS || vpn.isVpnPresent()) {
+            SessionError.VPN_REQUIRED
+        }
+        vpn.follow(group)
+    }
+
+    private fun startWatchdog(name: String) {
+        val checkWired = { tethering: UpstreamObservation ->
+            wired.check(System.currentTimeMillis()) { type -> readDownstream(tethering, listOf(type)) }
+        }
+        val guard = SessionWatchdog(name, checkDownstream = checkWired, onEnd = ::endFromWatchdog)
+        watchdog = guard
+        guard.start()
+
+        if (setup.wired == WiredTethering.OFF) return
+        events = TetheringEvents(context, guard::wake).also(TetheringEvents::register)
+    }
+
+    private fun endFromWatchdog(end: WatchdogEnd) {
+        when (end) {
+            is WatchdogEnd.Failed -> tearDownAfter(end.problem)
+            is WatchdogEnd.Finished -> stop()
+        }
+    }
+
+    private fun tearDownAfter(problem: String) {
+        stop()
+
+        val teardownProblem = detail.takeIf { state == SessionState.ERROR }
+        state = SessionState.ERROR
+        detail = when (teardownProblem) {
+            null -> problem
+            else -> "$problem${SessionError.TEARDOWN_INCOMPLETE}$teardownProblem"
+        }
+    }
+
+    private fun preferTestNetworks() {
+        val api = TetheringPreferenceApi(context)
+        runCatching { api.setPreferTestNetworks(false) }
+            .onFailure { SessionLog.warn("could not clear the stale test-network preference: ${it.message}") }
+        api.setPreferTestNetworks(true)
+    }
+
+    private fun verifyUpstream(name: String) {
+        val deadline = System.currentTimeMillis() + UPSTREAM_SETTLE_MS
+        var observed = liveUpstreams(name)
+
+        while (System.currentTimeMillis() < deadline) {
+            if (observed.isNotEmpty() && observed.all { it == name }) return
+            Thread.sleep(UPSTREAM_POLL_MS)
+            observed = liveUpstreams(name)
+        }
+        error("${SessionError.UPSTREAM_NOT_VERIFIED} expected only $name, tethering reports $observed")
+    }
+
+    private fun liveUpstreams(owned: String): List<String> =
+        inspector.observe().liveInterfaceNames(owned)
+
+    fun stop(): String {
+        warningConnections?.stop()
+        warningConnections = null
+        watchdog?.stop()
+        watchdog = null
+        events?.unregister()
+        events = null
+        vpn.stop()
+        teardown.removeShutdownHook()
+
+        val summary = if (activeSince == 0L) null else sessionSummary()
+
+        val downstreamProblem = teardown.releaseDownstream(started.types)
+        started.clear()
+
+        teardown.releaseUpstreamSelection(interfaceName)
+
+        val releaseProblems = resources?.release().orEmpty()
+        resources = null
+
+        interfaceName = null
+        activeSince = 0
+        state = if (downstreamProblem == null) SessionState.IDLE else SessionState.ERROR
+        detail = downstreamProblem ?: "stopped"
+
+        when (downstreamProblem) {
+            null -> SessionLog.info("session stopped; downstream confirmed down")
+            else -> SessionLog.error("teardown: $downstreamProblem")
+        }
+        if (releaseProblems.isNotEmpty()) {
+            SessionLog.warn("${releaseProblems.size} resource(s) not released cleanly")
+        }
+        summary?.let(SessionLog::info)
+        return status()
+    }
+
+    private fun sessionSummary(): String {
+        val traffic = interfaceName?.let(InterfaceCounters::read) ?: Traffic()
+        val elapsed = when (activeSince) {
+            0L -> 0L
+            else -> System.currentTimeMillis() - activeSince
+        }
+
+        return describeSession(elapsed, traffic)
+    }
+
+    fun status(): String = JSONObject().apply {
+        put("warning", JSONObject(warningStatus()))
+        put("clientIdentity", JSONObject(resources?.clientIdentityStatus() ?: "{}"))
+        put("state", state.name)
+        put("detail", detail)
+        put("downstreams", JSONArray(started.types.map { type -> type.name }))
+        put("isWaitingForWired", isActive && wired.isWaitingForWired)
+        put("interface", interfaceName ?: JSONObject.NULL)
+
+        put("isVpnBound", vpn.isBound)
+        put("isVpnBypassed", isVpnBypassed())
+
+        val traffic = interfaceName?.let(InterfaceCounters::read) ?: Traffic()
+        put("bytesUp", traffic.up)
+        put("bytesDown", traffic.down)
+        put("clientCount", if (isActive) downstream.countDevices(setup.types) else 0)
+    }.toString()
+
+    private fun isVpnBypassed(): Boolean {
+        if (vpnMode != VpnMode.NEVER) return false
+        if (!isActive) return false
+
+        return vpn.isVpnPresent()
+    }
+
+    private fun tunAddresses() = listOf(
+        buildLinkAddress(java.net.InetAddress.getByName(TUN_ADDRESS), TUN_PREFIX_LENGTH),
+        buildLinkAddress(java.net.InetAddress.getByName(TUN_ADDRESS_V6), TUN_PREFIX_LENGTH_V6),
+    )
+
+    private companion object {
+        const val TAG = "TetherSession"
+        const val TUN_ADDRESS = "192.0.2.2"
+        const val TUN_PREFIX_LENGTH = 24
+
+        const val TUN_ADDRESS_V6 = "2001:db8::2"
+        const val TUN_PREFIX_LENGTH_V6 = 64
+
+        const val TUN_MTU = 1500
+        const val AVAILABILITY_TIMEOUT_MS = 10_000
+        const val UPSTREAM_SETTLE_MS = 8_000L
+        const val UPSTREAM_POLL_MS = 500L
+    }
+}
